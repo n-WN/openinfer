@@ -54,6 +54,15 @@ pub(crate) struct VerifyGraphBuffers {
     all_logits: HiddenStates,
     /// Device-resident concatenated verify tokens `[max_total_rows]`.
     token_ids_d: CudaSlice<u32>,
+    /// Rejection-sampling scratch for sampled verify requests (#512): the
+    /// post-filter target distribution over one request's `span` positions,
+    /// the (one-hot) draft proposal scratch, the draft ids, and the chain
+    /// kernel's output row. Sized for a single request — sampled requests
+    /// verify one at a time (greedy rows keep the batched argmax path).
+    spec_target_probs: CudaSlice<f32>,
+    spec_draft_probs: CudaSlice<f32>,
+    spec_draft_ids: CudaSlice<i32>,
+    spec_out: CudaSlice<i32>,
     /// Paged-attention plan, refilled in place each step.
     plan: PrefillPagedPlan,
     /// Piecewise CUDA Graphs: `graphs[bucket_idx][segment]`. Each bucket's verify
@@ -115,6 +124,12 @@ impl VerifyGraphBuffers {
             )?,
             all_logits_normed: HiddenStates::zeros(ctx, hidden_dim, max_total_rows)?,
             all_logits: HiddenStates::zeros(ctx, vocab, max_total_rows)?,
+            spec_target_probs: ctx.stream.alloc_zeros(span * vocab)?,
+            spec_draft_probs: ctx
+                .stream
+                .alloc_zeros(span.saturating_sub(1).max(1) * vocab)?,
+            spec_draft_ids: ctx.stream.alloc_zeros(span)?,
+            spec_out: ctx.stream.alloc_zeros(span)?,
             token_ids_d: ctx.stream.alloc_zeros(max_total_rows)?,
             plan: PrefillPagedPlan::new_preallocated(
                 ctx,
@@ -155,6 +170,28 @@ impl VerifyGraphBuffers {
     }
 
     /// All-position logits `[vocab, total_rows]` from the last forward.
+    /// Split-borrow for one sampled verify call: the (shared) all-position
+    /// logits plus the (mutable) rejection-sampling scratch. Field-level
+    /// disjointness makes the shared/mutable mix legal.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn spec_view(
+        &mut self,
+    ) -> (
+        &HiddenStates,
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<i32>,
+        &mut CudaSlice<i32>,
+    ) {
+        (
+            &self.all_logits,
+            &mut self.spec_target_probs,
+            &mut self.spec_draft_probs,
+            &mut self.spec_draft_ids,
+            &mut self.spec_out,
+        )
+    }
+
     pub(crate) fn all_logits(&self) -> &HiddenStates {
         &self.all_logits
     }

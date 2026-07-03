@@ -135,6 +135,30 @@ pub(crate) fn accept_greedy(proposed: &[u32], target_argmax: &[u32]) -> Vec<u32>
     committed
 }
 
+/// Sampled speculative acceptance: convert one row of the chain
+/// rejection-sampling kernel's output into the committed-token contract
+/// [`accept_greedy`] established — the longest accepted draft prefix followed
+/// by exactly one model token (the residual resample at the first rejection,
+/// or the bonus continuation on full acceptance), i.e. always `1..=K + 1`
+/// tokens. The kernel writes `-1` after the stop, so the committed run is
+/// the prefix before the first `-1`.
+///
+/// # Panics
+/// Panics (debug builds) if the row is empty or the first slot is `-1` —
+/// the kernel always emits at least the resample/bonus token.
+#[must_use]
+pub(crate) fn committed_from_chain_row(out_row: &[i32]) -> Vec<u32> {
+    debug_assert!(
+        !out_row.is_empty() && out_row[0] >= 0,
+        "chain sampling emits at least one token per row"
+    );
+    out_row
+        .iter()
+        .take_while(|&&t| t >= 0)
+        .map(|&t| t as u32)
+        .collect()
+}
+
 /// Length of the accepted prefix: leading drafts whose token matches the
 /// target's argmax.
 fn num_accepted(proposed: &[u32], target_argmax: &[u32]) -> usize {
@@ -189,6 +213,17 @@ pub(crate) fn build_verify_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_row_full_acceptance_keeps_bonus() {
+        assert_eq!(committed_from_chain_row(&[7, 8, 9]), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn chain_row_stops_at_first_sentinel() {
+        assert_eq!(committed_from_chain_row(&[7, -1, -1]), vec![7]);
+        assert_eq!(committed_from_chain_row(&[7, 8, -1]), vec![7, 8]);
+    }
 
     #[test]
     fn accepts_full_run_plus_bonus() {

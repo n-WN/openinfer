@@ -151,8 +151,9 @@ pub(super) fn execute_plan(
 }
 
 /// All-or-nothing: speculate the whole active batch only when every request is
-/// draft-ready and greedy (no LoRA, no logprobs). A single non-ready request
-/// falls the batch back to plain decode rather than running a mixed step.
+/// draft-ready and spec-verifiable (no LoRA, no logprobs). A single non-ready
+/// request falls the batch back to plain decode rather than running a mixed
+/// step.
 pub(super) fn should_speculative_decode(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
@@ -163,8 +164,18 @@ pub(super) fn should_speculative_decode(
             executor.speculative_request_ready(req.request_id)
                 && req.lora_adapter.is_none()
                 && req.logprobs == 0
-                && req.params.is_greedy()
+                && spec_verify_supported(&req.params)
         })
+}
+
+/// Whether a request's sampling params are verifiable speculatively: greedy
+/// (argmax acceptance) or plain sampling (chain rejection sampling, #512).
+/// `min_p` is out — it is a sampling-time mask, not a renorm, so the target
+/// distribution the rejection kernel needs is not representable; per-request
+/// seeds are out — the chain kernel draws from its own philox stream, so a
+/// seeded request's replay contract cannot be honored on the speculative path.
+pub(super) fn spec_verify_supported(params: &openinfer_core::sampler::SamplingParams) -> bool {
+    params.is_greedy() || (params.min_p == 0.0 && params.seed.is_none())
 }
 
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {

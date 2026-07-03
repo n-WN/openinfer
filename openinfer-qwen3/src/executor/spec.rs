@@ -27,8 +27,9 @@ impl Qwen3Executor {
                 req.request_id
             );
             anyhow::ensure!(
-                req.params.is_greedy(),
-                "speculative verification currently supports greedy sampling only"
+                req.params.is_greedy() || (req.params.min_p == 0.0 && req.params.seed.is_none()),
+                "speculative verification supports greedy or plain sampling \
+                 (min_p and per-request seeds are gated off the speculative path)"
             );
             anyhow::ensure!(
                 self.dflash_ready_requests.contains(&req.request_id),

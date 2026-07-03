@@ -38,7 +38,10 @@ pub use openinfer_engine::sampler::SamplingParams;
 /// Low-level batched sampling, re-exported so a model that must drive its own
 /// greedy path still reaches the single sampler entry rather than dipping into
 /// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
-pub use openinfer_kernels::ops::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into};
+pub use openinfer_kernels::ops::{
+    BatchSamplingRow, BatchSamplingScratch, SpecAcceptCounts, SpecAcceptScratch,
+    gpu_sample_batch_into, gpu_spec_accept_into, gpu_verify_probs_into,
+};
 
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
@@ -63,6 +66,13 @@ pub struct SampleScratch {
 }
 
 impl SampleScratch {
+    /// The batched-sampling half of the scratch, for callers that drive the
+    /// FlashInfer pipeline directly (the speculative verify path builds the
+    /// target distribution through it).
+    pub fn batch_sampling_mut(&mut self) -> &mut openinfer_kernels::ops::BatchSamplingScratch {
+        &mut self.sampling
+    }
+
     pub fn new(ctx: &DeviceContext, vocab: usize, max_rows: usize) -> Result<Self> {
         ensure!(
             vocab > 0 && max_rows > 0,

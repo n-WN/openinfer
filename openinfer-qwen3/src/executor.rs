@@ -2721,6 +2721,13 @@ struct LocalQwen3Lane {
     layout: KvLayout,
     bufs: BatchDecodeBuffers,
     sample_scratch: openinfer_sample::SampleScratch,
+    /// Per-verify philox seed for sampled speculative acceptance; incremented
+    /// each call (uniqueness is the contract — seeded requests are gated off
+    /// the speculative path, so no replay guarantee is owed here).
+    spec_sample_seed: u64,
+    /// Allocate-once device counters for the chain-rejection kernel (the
+    /// sampled-verify path runs one request per call, hence capacity 1).
+    spec_accept_scratch: openinfer_sample::SpecAcceptScratch,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
     /// the scheduler wires generated counts through (sampling-parity 1b).
@@ -2789,12 +2796,15 @@ impl LocalQwen3Lane {
             model.config().vocab_size,
             max_bucket,
         )?;
+        let spec_accept_scratch = openinfer_sample::SpecAcceptScratch::new(model.device_ctx(), 1)?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            spec_sample_seed: 0,
+            spec_accept_scratch,
             steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
@@ -2999,7 +3009,21 @@ impl LocalQwen3Lane {
             let greedy = SamplingParams::default();
             let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
             let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
-            let request_results = build_verify_results(requests, &target_tokens)?;
+            let mut request_results = build_verify_results(requests, &target_tokens)?;
+            // Sampled requests replace the greedy acceptance with chain
+            // rejection sampling over the same all-position logits; greedy
+            // rows keep the batched-argmax result untouched.
+            let mut row_offset = 0usize;
+            for (i, req) in requests.iter().enumerate() {
+                let span_len = req.as_slice().len();
+                if !req.params.is_greedy() {
+                    let committed =
+                        self.spec_accept_sampled(req, row_offset, span_len, &mut bufs)?;
+                    request_results[i].matched_draft_tokens = committed.len() - 1;
+                    request_results[i].accepted_tokens = committed;
+                }
+                row_offset += span_len;
+            }
             self.record_verify_dflash_context(
                 requests,
                 &request_results,
@@ -3011,6 +3035,71 @@ impl LocalQwen3Lane {
         })();
         self.verify_bufs = Some(bufs);
         result
+    }
+
+    /// Chain rejection sampling for one sampled verify request (#512): build
+    /// the post-filter target distribution over the request's `span` verify
+    /// positions, run the chain accept/resample kernel against the greedy
+    /// drafts (a one-hot proposal — DFlash proposes by argmax, so
+    /// `q(x) = delta(x - draft)` and acceptance is `min(1, p_target(draft))`,
+    /// still distribution-exact), and return the committed run in
+    /// [`accept_greedy`]'s contract: accepted prefix + exactly one model token.
+    fn spec_accept_sampled(
+        &mut self,
+        req: &VerifyStepItem,
+        row_offset: usize,
+        span_len: usize,
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<Vec<u32>> {
+        let ctx = self.model.device_ctx();
+        let num_drafts = span_len - 1;
+        anyhow::ensure!(num_drafts > 0, "sampled verify needs at least one draft");
+        let rows: Vec<openinfer_sample::BatchSamplingRow> = (0..span_len)
+            .map(|j| openinfer_sample::BatchSamplingRow {
+                row: row_offset + j,
+                temperature: req.params.temperature,
+                top_k: req.params.top_k,
+                top_p: req.params.top_p,
+                min_p: req.params.min_p,
+            })
+            .collect();
+        let drafts: Vec<i32> = req.as_slice()[1..].iter().map(|&t| t as i32).collect();
+        let (all_logits, target_probs, draft_probs, draft_ids, out) = bufs.spec_view();
+        ctx.stream
+            .memcpy_htod(&drafts, &mut draft_ids.slice_mut(0..num_drafts))?;
+        openinfer_sample::gpu_verify_probs_into(
+            ctx,
+            all_logits.as_ref(),
+            &rows,
+            target_probs,
+            self.sample_scratch.batch_sampling_mut(),
+        )?;
+        // One fresh philox seed per verify call. Executor-local rather than
+        // scheduler-threaded: unseeded sampled requests carry no replay
+        // contract, uniqueness is what matters (seeded requests are gated off
+        // the speculative path entirely).
+        self.spec_sample_seed = self.spec_sample_seed.wrapping_add(1);
+        let vocab = self.model.config().vocab_size;
+        // The DFlash drafter is greedy (argmax), so the proposal is the one-hot
+        // q(x) = delta(x - draft); the commit below scans the output row itself
+        // (committed_from_chain_row), so the returned counts are telemetry only.
+        let _counts = openinfer_sample::gpu_spec_accept_into(
+            ctx,
+            draft_probs,
+            draft_ids,
+            target_probs,
+            out,
+            1,
+            num_drafts,
+            vocab,
+            /*onehot_draft=*/ true,
+            self.spec_sample_seed,
+            0,
+            &mut self.spec_accept_scratch,
+        )?;
+        let out_h = ctx.stream.clone_dtoh(&out.slice(0..span_len))?;
+        ctx.sync()?;
+        Ok(crate::speculative::committed_from_chain_row(&out_h))
     }
 
     fn execute_decode(
