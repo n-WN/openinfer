@@ -1,12 +1,12 @@
 # GLM5.2 DSA Indexer Forward (PR2 model-crate)
 
-> **TL;DR:** Wire `openinfer-glm52/src/indexer.rs` — `Glm52IndexerLayerWeights` + `glm52_indexer_forward` — composing the 6 kernel ops already on main (#489) into a DSA decode indexer that produces `topk_indices[2048]`. Aligned to vllm's `DeepseekV32Indexer` (the production reference). Three ops are missing from the repo and must be added: LayerNorm (k_norm, eps=1e-6, with bias), interleaved indexer RoPE (64-dim, q+k), and weights-fold (`weights * q_scale * softmax_scale * n_heads^-0.5`). Oracle gate extends the existing harness (#499) with a `topk_indices` set-overlap assertion. `from_host` only; `from_device` deferred to PR4.
+> **TL;DR:** Wire `pegainfer-glm52/src/indexer.rs` — `Glm52IndexerLayerWeights` + `glm52_indexer_forward` — composing the 6 kernel ops already on main (#489) into a DSA decode indexer that produces `topk_indices[2048]`. Aligned to vllm's `DeepseekV32Indexer` (the production reference). Three ops are missing from the repo and must be added: LayerNorm (k_norm, eps=1e-6, with bias), interleaved indexer RoPE (64-dim, q+k), and weights-fold (`weights * q_scale * softmax_scale * n_heads^-0.5`). Oracle gate extends the existing harness (#499) with a `topk_indices` set-overlap assertion. `from_host` only; `from_device` deferred to PR4.
 >
 > **Last touched:** 2026-07
 
-## Why this doc replaces the PR2 section of `dp1-ep8-decode-plan.md`
+## Why this correction still matters
 
-The plan doc's PR2 data-flow diagram omits three steps that vllm's `DeepseekV32Indexer.forward` performs: **k_norm is a LayerNorm (not RMSNorm) with bias**, **per-head `weights_proj` + head-weighted score reduction** (fused inside DeepGEMM's `fp8_paged_mqa_logits`), and **ReLU** (also fused inside DeepGEMM). The plan also listed Hadamard; vllm's DSv32 path does NOT apply Hadamard (only TokenSpeed does). Aligning to vllm — which already landed the `weights` parameter in our DeepGEMM wrapper (#489) — means Hadamard is dropped for now. This doc is the corrected scope.
+The original bring-up data-flow omitted three steps that vLLM's `DeepseekV32Indexer.forward` performs: **k_norm is a LayerNorm (not RMSNorm) with bias**, **per-head `weights_proj` + head-weighted score reduction** (fused inside DeepGEMM's `fp8_paged_mqa_logits`), and **ReLU** (also fused inside DeepGEMM). It also listed Hadamard; vLLM's DSv32 path does NOT apply Hadamard (only TokenSpeed does). Aligning to vLLM — which already landed the `weights` parameter in our DeepGEMM wrapper (#489) — means Hadamard is dropped for now. This doc is the corrected contract.
 
 ## vllm cross-reference (the alignment target)
 
@@ -58,7 +58,7 @@ The oracle harness (`tools/accuracy/glm52_oracle.py`) runs transformers 5.12.1 (
 
 ## Scope
 
-### New model-crate file: `openinfer-glm52/src/indexer.rs`
+### New model-crate file: `pegainfer-glm52/src/indexer.rs`
 
 ```
 Glm52IndexerLayerWeights {
@@ -126,23 +126,23 @@ Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `oracle/m
    - Rust-vs-Rust (regression pin): **sha256 of slots** (same GPU, same kernel → deterministic).
 4. **Short-context regression**: at ctx <= 2048, sparse top-k == full top-k (the PR1 path). Assert the indexer's output matches `[0, 1, ..., position, -1, ...]` exactly.
 
-**Context for the gate**: ctx=4096 (where sparse != full). Requires `OPENINFER_TEST_MODEL_PATH` pointing to the GLM-5.2-FP8 checkpoint and an H200.
+**Context for the gate**: ctx=4096 (where sparse != full). Requires `PEGAINFER_TEST_MODEL_PATH` pointing to the GLM-5.2-FP8 checkpoint and an H200.
 
 ## Build & test
 
 ```bash
 # Build (SM90a, H200)
-export OPENINFER_DEEPGEMM_ROOT=openinfer-kernels/third_party/DeepGEMM/deep_gemm
+export PEGAINFER_DEEPGEMM_ROOT=pegainfer-kernels/third_party/DeepGEMM/deep_gemm
 export CUDA_HOME=/usr/local/cuda
-export OPENINFER_NCCL_ROOT=<path>
-cargo check --release -p openinfer-glm52 --features glm52
+export PEGAINFER_NCCL_ROOT=<path>
+cargo check --release -p pegainfer-glm52 --features glm52
 
 # Smoke test (no checkpoint needed — synthetic input, verify launch + shape)
-cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
+cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
 
 # Oracle gate (H200 + checkpoint)
-OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-  cargo test --release -p openinfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
+PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
+  cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
 ```
 
 ## Execution plan
@@ -156,10 +156,8 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 
 ## Read
 
-- `docs/models/glm52/dp1-ep8-decode-plan.md` — the 5-PR roadmap (PR2 section is superseded by this doc).
-- `docs/models/glm52/dsa-indexer.md` — PR2 kernel ops dev doc (the 6 ops already landed).
 - `docs/models/glm52/oracle-harness.md` — harness design, verification, pitfalls.
-- `openinfer-glm52/src/mla_decode.rs` — PR1 forward pattern to mirror.
+- `pegainfer-glm52/src/mla_decode.rs` — PR1 forward pattern to mirror.
 - `vllm/vllm/models/deepseek_v32/nvidia/attention.py:39-157` — `DeepseekV32Indexer` (alignment target).
 - `vllm/vllm/models/deepseek_v32/nvidia/kernels.py:87-364` — `fused_norm_rope` (k_norm + RoPE + quant + cache fused; reference for the unfused decomposition).
 - `vllm/vllm/model_executor/layers/sparse_attn_indexer.py:295-647` — `sparse_attn_indexer` (DeepGEMM logits + topk + slots).
@@ -167,7 +165,7 @@ OPENINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 
 ## Relevant history
 
-- PR2 kernel ops (#489) landed all 6 ops + smoke tests on H200. The model-crate forward wiring was explicitly deferred ("the remaining piece" — `dsa-indexer.md` debrief).
+- PR2 kernel ops (#489) landed all 6 ops and smoke tests on H200 before the model-crate forward was wired in #521.
 - Oracle harness (#499) landed the self-contained probe pipeline; MLA gate is green. Indexer gate was noted as the next extension.
 - transformers 5.12.1 had a RoPE contradiction (config says `indexer_rope_interleave=true` but modeling used non-interleave). Fixed in 5.13.0.dev0 PR #46842 (`8698b5a525`). The harness must bump its pin.
 - vllm's `DeepseekV32Indexer` is the production reference for GLM5.2 DSA. It does NOT apply Hadamard (unlike TokenSpeed). The `glm52_indexer_hadamard_bf16` kernel landed in #489 stays as dead code.

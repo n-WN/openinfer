@@ -7,7 +7,7 @@ the whole prefill (the stalled inter-token gap ≈ prefill wall-time: 4k ≈490m
 8k ≈1180ms, 12k ≈2230ms); gaps with no prefill in flight stay at baseline TPOT
 (~14ms). Whether that reaches headline **ITL p99** is a *frequency* question — it
 only does once stalls exceed ~1% of decode gaps, a fraction that grows with both
-**QPS and prompt length**. 
+**QPS and prompt length**.
 
 ## Motivation
 
@@ -106,14 +106,23 @@ every cell sits at baseline. Qwen3.5 **does** freeze decode per injection, same 
 Qwen3: a pending prefill with active decodes runs as a unified step (serial prefill
 then the decode graph, in one call), so each active decode eats one ~prefill-length
 gap — `max` confirms it (459 / 906 / 1408ms ≈ the prefill wall, throttle-check
-below). 
+below).
 
-p99 stays at baseline only as a **measurement artifact**: the background is
-capped at `--bg-output-len 1024` (~15s) and dies mid-run, so only the ~7 injections
-overlapping live decodes stall anything — ~0.7% of gaps, just under the 1% p99 knee
-(raising injections 5→15 doesn't move p99, since total gaps are capped by the
-1024-token background, not injection count). **Not** architectural immunity —
-chunked prefill bounds Qwen3.5's per-step freeze the same way it does Qwen3's.
+p99 stays at baseline as a **measurement artifact**, not architectural immunity.
+**Primary cause (issue [#470](https://github.com/pegainfer-project/pegainfer/issues/470)):**
+`bench_serving` hardcoded `max_batch=4` for Qwen3.5, so `--bg-concurrency 4` filled
+every slot and the injector could not admit until a background stream died —
+injected prefill never overlapped a full decode batch (`ITL_STEP` `decode_n` never
+reached 4). Secondary contributor on this older sweep: `--bg-output-len 1024` also
+capped how many gaps could be stalled (~0.7%, under the p99 knee).
+
+**Corrected post-chunking evidence** (RTX 4090, `--max-batch 8 --bg-concurrency 4`,
+cold only, with starvation negative control) lives in
+[`docs/models/qwen35/mixed-load-itl-470.md`](../models/qwen35/mixed-load-itl-470.md):
+with a free slot, Qwen3.5 shows the same severity/frequency structure as Qwen3;
+chunking bounds per-step max but can raise headline p99 at low QPS. The tables
+below are retained as the historical 5070 Ti artifact sweep — do **not** cite them
+as immunity.
 
 **qps = 0.25**
 | prompt | cold | warm½ | warm |
@@ -143,7 +152,7 @@ chunked prefill bounds Qwen3.5's per-step freeze the same way it does Qwen3's.
 | 8k  | 906 | 898 | 900 |
 | 12k | 1408 | 1381 | 1422 |
 
-## Explaination
+## Explanation
 
 Two independent knobs explain every cell:
 
@@ -193,8 +202,8 @@ no hard per-token SLA, or long prompts that share prefixes, leave it unbuilt.
 # Build (RTX 5070 Ti / Arch WSL2; SM 120, absolute Triton python):
 CUDA_HOME=/opt/cuda NVCC_PREPEND_FLAGS="-ccbin g++-13" \
   LIBRARY_PATH=/usr/lib/wsl/lib:/opt/cuda/lib64 \
-  OPENINFER_CUDA_SM=120 OPENINFER_TRITON_PYTHON=/abs/.venv/bin/python \
-  cargo build -r -p openinfer-server --bin bench_serving
+  PEGAINFER_CUDA_SM=120 PEGAINFER_TRITON_PYTHON=/abs/.venv/bin/python \
+  cargo build -r -p pegainfer-server --bin bench_serving
 
 BIN=./target/release/bench_serving
 BG="--bg-prompt-len 512 --bg-concurrency 4 --bg-output-len 1024"

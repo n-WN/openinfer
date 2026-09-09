@@ -1,0 +1,1034 @@
+use std::fs;
+use std::net::TcpListener;
+use std::time::Duration;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use pegainfer_sim::SimulatedEngineConfig;
+use pegainfer_sim::start_engine;
+use pegainfer_sim::start_engine_with_partitions;
+use reqwest::Client;
+use serde_json::Value;
+use serde_json::json;
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const MODEL_NAME: &str = "pegainfer-sim-e2e";
+const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
+const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
+const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
+/// The pretend drafter the spec-metrics server runs: `K` and how many of those
+/// draft tokens each verify step accepts.
+const SPEC_K: usize = 3;
+const SPEC_ACCEPTED: usize = 2;
+const SERVER_START_ATTEMPTS: usize = 5;
+
+struct SimServer {
+    base_url: String,
+    model_name: String,
+    shutdown: CancellationToken,
+    task: JoinHandle<Result<()>>,
+    _model_dir: TempDir,
+}
+
+impl SimServer {
+    async fn spawn() -> Result<Self> {
+        Self::spawn_with_model_dir(model_dir_with_minimal_metadata()?).await
+    }
+
+    async fn spawn_partitioned() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            2,
+            METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
+    }
+
+    /// A single engine whose every decode step is a verify step, so the
+    /// stepped bridge has spec-decode counters to stamp onto its batches.
+    async fn spawn_with_drafter() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            SPEC_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+                .with_speculative_decoding(SPEC_K, SPEC_ACCEPTED),
+        )
+        .await
+    }
+
+    async fn spawn_slow() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            SLOW_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 80.0, 1)?,
+        )
+        .await
+    }
+
+    async fn spawn_with_model_dir(model_dir: TempDir) -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir,
+            1,
+            MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?,
+        )
+        .await
+    }
+
+    async fn spawn_with_config(
+        model_dir: TempDir,
+        engine_count: usize,
+        model_name: &str,
+        config: SimulatedEngineConfig,
+    ) -> Result<Self> {
+        let mut last_error = None;
+        for attempt in 1..=SERVER_START_ATTEMPTS {
+            match Self::spawn_once(&model_dir, engine_count, model_name, config.clone()).await {
+                Ok(started) => {
+                    return Ok(Self {
+                        base_url: started.base_url,
+                        model_name: started.model_name,
+                        shutdown: started.shutdown,
+                        task: started.task,
+                        _model_dir: model_dir,
+                    });
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < SERVER_START_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("sim frontend startup was not attempted")))
+            .with_context(|| {
+                format!("failed to start sim frontend after {SERVER_START_ATTEMPTS} attempts")
+            })
+    }
+
+    async fn spawn_once(
+        model_dir: &TempDir,
+        engine_count: usize,
+        model_name: &str,
+        config: SimulatedEngineConfig,
+    ) -> Result<StartedSimServer> {
+        let port = reserve_loopback_port()?;
+        let base_url = format!("http://127.0.0.1:{port}");
+        let shutdown = CancellationToken::new();
+        let engine = start_engine_with_partitions(&config, engine_count);
+        let server_shutdown = shutdown.clone();
+        let served_model_name = model_name.to_string();
+        let started_model_name = served_model_name.clone();
+        let model_path_buf = model_dir.path().to_path_buf();
+        let mut task = tokio::spawn(async move {
+            pegainfer_frontend::vllm::serve_with_engine_count(
+                std::future::ready(Ok(engine.into())),
+                &model_path_buf,
+                vec![served_model_name],
+                port,
+                Some(128),
+                engine_count,
+                server_shutdown,
+            )
+            .await
+        });
+
+        let client = test_client()?;
+        let health_result = tokio::select! {
+            result = wait_for_health(&client, &base_url) => result,
+            result = &mut task => {
+                return match result {
+                    Ok(Ok(())) => Err(anyhow!("sim frontend exited before becoming healthy")),
+                    Ok(Err(error)) => Err(error).context("sim frontend exited before becoming healthy"),
+                    Err(error) => Err(error).context("sim frontend task panicked"),
+                };
+            }
+        };
+
+        if let Err(error) = health_result {
+            shutdown.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+            return Err(error);
+        }
+
+        Ok(StartedSimServer {
+            base_url,
+            model_name: started_model_name,
+            shutdown,
+            task,
+        })
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), self.task)
+            .await
+            .context("timed out waiting for sim frontend shutdown")?
+            .context("sim frontend task panicked")?
+    }
+}
+
+struct StartedSimServer {
+    base_url: String,
+    model_name: String,
+    shutdown: CancellationToken,
+    task: JoinHandle<Result<()>>,
+}
+
+fn empty_model_dir() -> Result<TempDir> {
+    tempfile::tempdir().context("failed to create temp model dir")
+}
+
+fn model_dir_with_minimal_metadata() -> Result<TempDir> {
+    let dir = empty_model_dir()?;
+
+    // The simulated frontend still builds the normal vLLM text/chat stack.
+    // Token-id prompts avoid tokenizer encode work, but generated ids still
+    // need a tokenizer for detokenization and a tiny config for metadata.
+    fs::write(dir.path().join("tokenizer.json"), TINY_TOKENIZER_JSON)
+        .context("failed to write tiny tokenizer.json")?;
+    fs::write(
+        dir.path().join("tokenizer_config.json"),
+        TINY_TOKENIZER_CONFIG_JSON,
+    )
+    .context("failed to write tiny tokenizer_config.json")?;
+    fs::write(dir.path().join("config.json"), TINY_CONFIG_JSON)
+        .context("failed to write tiny config.json")?;
+
+    Ok(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_engine_serves_openai_completions_over_http() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    assert_models_endpoint(&client, &server.base_url, &server.model_name).await?;
+    assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
+        .await?;
+    assert_streaming_completion_emits_done(&client, &server.base_url, &server.model_name).await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_http_endpoint_exports_per_engine_scheduler_metrics() -> Result<()> {
+    let server = SimServer::spawn_partitioned().await?;
+    let client = test_client()?;
+
+    assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
+        .await?;
+    // Two real schedulers: a finishing step stamps drained occupancy, so both
+    // engines settle at zero. There is no watch to inject fake KV/running.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:num_requests_running", "0", 0.0),
+            ("vllm:num_requests_running", "1", 0.0),
+            ("vllm:num_requests_waiting", "0", 0.0),
+            ("vllm:num_requests_waiting", "1", 0.0),
+            ("vllm:kv_cache_usage_perc", "0", 0.0),
+            ("vllm:kv_cache_usage_perc", "1", 0.0),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepped_bridge_reports_spec_decode_counters_to_prometheus() -> Result<()> {
+    // One verify step per decode step, so the totals are the drafter's shape
+    // times the tokens generated: 4 drafts, 4 x 3 = 12 proposed, 4 x 2 = 8
+    // accepted, and positions 0 and 1 credited every step.
+    const SPEC_MAX_TOKENS: usize = 4;
+
+    let server = SimServer::spawn_with_drafter().await?;
+    let client = test_client()?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": [1, 2],
+        "max_tokens": SPEC_MAX_TOKENS,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    });
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let drafts = SPEC_MAX_TOKENS as f64;
+    // `_total` is appended at exposition; the registered name scrapes empty.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:spec_decode_num_drafts_total", "0", drafts),
+            (
+                "vllm:spec_decode_num_draft_tokens_total",
+                "0",
+                drafts * SPEC_K as f64,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_total",
+                "0",
+                drafts * SPEC_ACCEPTED as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    wait_for_labeled_metrics(
+        &client,
+        &server.base_url,
+        &[
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "0")][..],
+                drafts,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "1")][..],
+                drafts,
+            ),
+            (
+                "vllm:spec_decode_num_accepted_tokens_per_pos_total",
+                "0",
+                &[("position", "2")][..],
+                0.0,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    // Exposition is one series per draft slot the drafter has, so the fixed
+    // `MAX_SPEC_TOKENS` array width must not leak past `K`.
+    let metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let leaked: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.contains(&format!("model_name=\"{}\"", server.model_name))
+                && line.contains(&format!("position=\"{SPEC_K}\""))
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "per-position series past K={SPEC_K} were exposed: {leaked:?}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_gauge_rises_during_a_slow_request() -> Result<()> {
+    let server = SimServer::spawn_slow().await?;
+    let client = test_client()?;
+
+    let inflight = {
+        let client = client.clone();
+        let url = format!("{}/v1/completions", server.base_url);
+        let body = json!({
+            "model": server.model_name,
+            "prompt": [1, 2],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "ignore_eos": true,
+        });
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<_, anyhow::Error>(())
+        })
+    };
+
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:num_requests_running", "0", 1.0)],
+        &server.model_name,
+    )
+    .await?;
+
+    inflight.await.context("slow completion task panicked")??;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:num_requests_running", "0", 0.0)],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+async fn wait_for_metrics(
+    client: &Client,
+    base_url: &str,
+    expected: &[(&str, &str, f64)],
+    model_name: &str,
+) -> Result<()> {
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|(metric, engine, value)| (*metric, *engine, &[][..], *value))
+        .collect();
+    wait_for_labeled_metrics(client, base_url, &expected, model_name).await
+}
+
+/// One expected exposition line: metric name, `engine` label, any further
+/// labels, and the value it must carry.
+type ExpectedMetric<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], f64);
+
+/// [`wait_for_metrics`] plus arbitrary extra labels, for families keyed by more
+/// than engine and model — the per-position spec-decode counter adds `position`.
+async fn wait_for_labeled_metrics(
+    client: &Client,
+    base_url: &str,
+    expected: &[ExpectedMetric<'_>],
+    model_name: &str,
+) -> Result<()> {
+    let metrics_url = format!("{base_url}/metrics");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_metrics = String::new();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for scheduler metrics at {metrics_url}:\n{last_metrics}");
+        }
+
+        if let Ok(response) = client.get(&metrics_url).send().await {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(metrics) = response.text().await {
+                    let all_found =
+                        expected
+                            .iter()
+                            .all(|(metric, engine, labels, expected_value)| {
+                                metrics.lines().any(|line| {
+                                    line.starts_with(metric)
+                                        && line.contains(&format!("engine=\"{engine}\""))
+                                        && line.contains(&format!("model_name=\"{model_name}\""))
+                                        && labels.iter().all(|(name, value)| {
+                                            line.contains(&format!("{name}=\"{value}\""))
+                                        })
+                                        && line
+                                            .rsplit_once(' ')
+                                            .and_then(|(_, value)| value.parse::<f64>().ok())
+                                            .is_some_and(|value| {
+                                                (value - expected_value).abs() < 1e-9
+                                            })
+                                })
+                            });
+                    if all_found {
+                        return Ok(());
+                    }
+                    last_metrics = metrics;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontend_rejects_engine_partition_mismatch() -> Result<()> {
+    let model_dir = model_dir_with_minimal_metadata()?;
+    let port = reserve_loopback_port()?;
+    let engine = start_engine(&SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        pegainfer_frontend::vllm::serve_with_engine_count(
+            std::future::ready(Ok(engine.into())),
+            model_dir.path(),
+            vec![MODEL_NAME.to_string()],
+            port,
+            Some(128),
+            2,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .context("partition-mismatch server did not stop")?;
+    let error = result.expect_err("one scheduler partition cannot register as two engines");
+    if !error
+        .to_string()
+        .contains("declared 2 engines but the launched engine exposes 1 schedulers")
+    {
+        bail!("unexpected partition-mismatch error: {error:#}");
+    }
+    Ok(())
+}
+
+// The old "mounted LoRA routes report unsupported" sim test is gone by
+// construction: `serve_model_with_lora_routes` now requires an `Engine` whose
+// `lora` capability is `Some(LoraClient)` — the `Option` is the capability —
+// and the simulated engine does not mint a LoRA channel. The gone-engine HTTP
+// mapping is pinned by the `vllm::lora` route tests.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_streaming_completion_returns_nonempty_output_for_positive_max_tokens() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
+        .await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_lora_xarg_rejects_only_its_request() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+    let mut body = completion_body(&server.model_name, false);
+    body["vllm_xargs"] = json!({ "pegainfer_lora_adapter": 123 });
+
+    let response = client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?;
+    let status = response.status();
+    let response_body = response.text().await?;
+    if status.is_success() {
+        bail!("invalid pegainfer_lora_adapter unexpectedly succeeded: {response_body}");
+    }
+
+    assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
+        .await?;
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_completion_emits_terminal_done() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    assert_streaming_completion_emits_done(&client, &server.base_url, &server.model_name).await?;
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_returns_correct_format() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response: Value = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha beta"}],
+            "max_tokens": 4,
+            "temperature": 0.0
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(
+        response["object"].as_str(),
+        Some("chat.completion"),
+        "object field must be chat.completion: {response}"
+    );
+
+    let choice = &response["choices"][0];
+    assert_eq!(
+        choice["message"]["role"].as_str(),
+        Some("assistant"),
+        "message role must be assistant: {response}"
+    );
+    assert!(
+        choice["message"]["content"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "message content must be a non-empty string: {response}"
+    );
+    assert_eq!(
+        choice["finish_reason"].as_str(),
+        Some("length"),
+        "finish_reason must be length when max_tokens is exhausted: {response}"
+    );
+
+    let usage = &response["usage"];
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.prompt_tokens missing: {response}"))?;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.completion_tokens missing: {response}"))?;
+    let total_tokens = usage["total_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.total_tokens missing: {response}"))?;
+    assert!(
+        prompt_tokens > 0,
+        "prompt_tokens must be positive: {response}"
+    );
+    assert_eq!(
+        completion_tokens, 4,
+        "completion_tokens must equal max_tokens: {response}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "total_tokens must equal prompt + completion: {response}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_streaming_emits_role_content_and_done() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "stream": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
+
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
+
+    assert!(
+        !chunks.is_empty(),
+        "streaming response must contain at least one chunk"
+    );
+
+    for chunk in &chunks {
+        assert_eq!(
+            chunk["object"].as_str(),
+            Some("chat.completion.chunk"),
+            "chunk object must be chat.completion.chunk: {chunk}"
+        );
+    }
+
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"]["role"].as_str(),
+        Some("assistant"),
+        "first chunk must declare assistant role: {}",
+        chunks[0]
+    );
+
+    let content: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(
+        content, " alpha alpha",
+        "streaming response must emit the simulated content: {stream_text}"
+    );
+
+    let last_chunk = chunks.last().expect("at least one chunk");
+    assert_eq!(
+        last_chunk["choices"][0]["finish_reason"].as_str(),
+        Some("length"),
+        "last chunk must carry finish_reason: {last_chunk}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_completions_usage_with_stream_options() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", server.base_url))
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "alpha"}],
+            "max_tokens": 3,
+            "temperature": 0.0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_event_stream_content_type(&response)?;
+    let stream_text = response.text().await?;
+
+    let chunks = parse_terminal_sse_chunks(&stream_text)?;
+    let usage_indices: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!chunk["usage"].is_null()).then_some(index))
+        .collect();
+    assert_eq!(
+        usage_indices.len(),
+        1,
+        "stream_options.include_usage must emit exactly one usage chunk: {stream_text}"
+    );
+
+    let usage_index = usage_indices[0];
+    let usage_chunk = &chunks[usage_index];
+    assert_eq!(
+        usage_chunk["choices"].as_array().map(Vec::len),
+        Some(0),
+        "usage chunk must not contain choices: {usage_chunk}"
+    );
+
+    let finish_index = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"] == "length")
+        .ok_or_else(|| anyhow!("streaming response has no length finish chunk: {stream_text}"))?;
+    assert_eq!(
+        usage_index,
+        finish_index + 1,
+        "usage chunk must immediately follow the finish chunk: {stream_text}"
+    );
+    assert_eq!(
+        usage_index,
+        chunks.len() - 1,
+        "usage chunk must be the final JSON chunk before [DONE]: {stream_text}"
+    );
+
+    let usage = &usage_chunk["usage"];
+    let prompt_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.prompt_tokens missing: {usage_chunk}"))?;
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.completion_tokens missing: {usage_chunk}"))?;
+    let total_tokens = usage["total_tokens"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("usage.total_tokens missing: {usage_chunk}"))?;
+    assert!(
+        prompt_tokens > 0,
+        "usage.prompt_tokens must be positive: {usage_chunk}"
+    );
+    assert_eq!(
+        completion_tokens, 3,
+        "usage.completion_tokens must equal max_tokens: {usage_chunk}"
+    );
+    assert_eq!(
+        total_tokens,
+        prompt_tokens + completion_tokens,
+        "usage.total_tokens must equal prompt + completion: {usage_chunk}"
+    );
+
+    server.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
+    let model_dir = model_dir_with_minimal_metadata()?;
+    for file in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
+        if !model_dir.path().join(file).is_file() {
+            bail!("minimal simulated frontend metadata fixture is missing {file}");
+        }
+    }
+
+    let server = SimServer::spawn_with_model_dir(model_dir).await?;
+    server.shutdown().await?;
+
+    let error = match SimServer::spawn_with_model_dir(empty_model_dir()?).await {
+        Ok(server) => {
+            server.shutdown().await?;
+            bail!("empty local model metadata directory should fail frontend startup");
+        }
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    if !message.contains("supported tokenizer file") || !message.contains("tokenizer.json") {
+        bail!("empty metadata dir failed with unexpected error: {message}");
+    }
+
+    Ok(())
+}
+
+#[path = "frontend_e2e/logprobs.rs"]
+mod logprobs;
+
+async fn assert_models_endpoint(client: &Client, base_url: &str, model_name: &str) -> Result<()> {
+    let models: Value = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let advertised = models["data"]
+        .as_array()
+        .ok_or_else(|| anyhow!("/v1/models response has no data array"))?;
+    if !advertised.iter().any(|model| model["id"] == model_name) {
+        bail!("/v1/models did not advertise {model_name}: {models}");
+    }
+
+    Ok(())
+}
+
+async fn assert_non_streaming_completion_has_output(
+    client: &Client,
+    base_url: &str,
+    model_name: &str,
+) -> Result<()> {
+    let completion: Value = post_completion(client, base_url, model_name, false).await?;
+    let text = completion["choices"][0]["text"]
+        .as_str()
+        .ok_or_else(|| anyhow!("non-streaming completion has no text: {completion}"))?;
+    if text.is_empty() {
+        bail!("non-streaming completion returned empty text for max_tokens > 0");
+    }
+
+    Ok(())
+}
+
+async fn assert_streaming_completion_emits_done(
+    client: &Client,
+    base_url: &str,
+    model_name: &str,
+) -> Result<()> {
+    let stream = post_completion_stream(client, base_url, model_name).await?;
+    if !stream.lines().any(|line| line.trim() == "data: [DONE]") {
+        bail!("streaming completion did not emit terminal data: [DONE]: {stream}");
+    }
+
+    Ok(())
+}
+
+async fn post_completion(
+    client: &Client,
+    base_url: &str,
+    model_name: &str,
+    stream: bool,
+) -> Result<Value> {
+    let response = client
+        .post(format!("{base_url}/v1/completions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(completion_body(model_name, stream).to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+    response
+        .json()
+        .await
+        .context("failed to parse non-streaming completion response")
+}
+
+async fn post_completion_stream(
+    client: &Client,
+    base_url: &str,
+    model_name: &str,
+) -> Result<String> {
+    client
+        .post(format!("{base_url}/v1/completions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(completion_body(model_name, true).to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await
+        .context("failed to read streaming completion response")
+}
+
+fn test_client() -> Result<Client> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("failed to build HTTP test client")
+}
+
+fn completion_body(model_name: &str, stream: bool) -> Value {
+    json!({
+        "model": model_name,
+        "prompt": [1, 2],
+        "max_tokens": 3,
+        "temperature": 0.0,
+        "ignore_eos": true,
+        "stream": stream
+    })
+}
+
+fn assert_event_stream_content_type(response: &reqwest::Response) -> Result<()> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .ok_or_else(|| anyhow!("streaming response is missing Content-Type"))?
+        .to_str()
+        .context("streaming response has an invalid Content-Type")?;
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if media_type != "text/event-stream" {
+        bail!("streaming response must use text/event-stream, got {content_type}");
+    }
+    Ok(())
+}
+
+fn parse_terminal_sse_chunks(stream: &str) -> Result<Vec<Value>> {
+    let normalized = stream.replace("\r\n", "\n").replace('\r', "\n");
+    let mut payloads = Vec::new();
+    let mut data_lines = Vec::new();
+
+    for line in normalized.split_terminator('\n') {
+        if line.is_empty() {
+            if !data_lines.is_empty() {
+                payloads.push(data_lines.join("\n"));
+                data_lines.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    if !data_lines.is_empty() {
+        bail!("streaming response ended before its final SSE event was dispatched: {stream}");
+    }
+
+    let done_count = payloads
+        .iter()
+        .filter(|payload| payload.as_str() == "[DONE]")
+        .count();
+    if done_count != 1 {
+        bail!("streaming response must contain exactly one data: [DONE]: {stream}");
+    }
+    if payloads.last().map(String::as_str) != Some("[DONE]") {
+        bail!("streaming response must end with data: [DONE]: {stream}");
+    }
+
+    payloads[..payloads.len() - 1]
+        .iter()
+        .map(|payload| serde_json::from_str(payload))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to parse streaming chunks")
+}
+
+#[test]
+fn sse_parser_requires_dispatched_events_and_unique_terminal_done() -> Result<()> {
+    let valid = "data: {\"object\":\"chat.completion.chunk\"}\n\ndata:[DONE]\n\n";
+    assert_eq!(parse_terminal_sse_chunks(valid)?.len(), 1);
+
+    let missing_separator = "data: {\"object\":\"chat.completion.chunk\"}\ndata:[DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(missing_separator).is_err());
+
+    let duplicate_done = "data: {}\n\ndata:[DONE]\n\ndata: [DONE]\n\n";
+    assert!(parse_terminal_sse_chunks(duplicate_done).is_err());
+
+    let undispatched_done = "data: {}\n\ndata:[DONE]";
+    assert!(parse_terminal_sse_chunks(undispatched_done).is_err());
+
+    let line_terminated_but_undispatched_done = "data: {}\n\ndata:[DONE]\n";
+    assert!(parse_terminal_sse_chunks(line_terminated_but_undispatched_done).is_err());
+
+    Ok(())
+}
+
+async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
+    let health_url = format!("{base_url}/health");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for sim frontend health at {health_url}");
+        }
+
+        match client
+            .get(&health_url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+fn reserve_loopback_port() -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to reserve loopback port for sim e2e test")?;
+    Ok(listener.local_addr()?.port())
+}
+
+const TINY_TOKENIZER_JSON: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "alpha": 1,
+      "beta": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#;
+
+const TINY_TOKENIZER_CONFIG_JSON: &str = r#"{
+  "unk_token": "<unk>",
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
+}"#;
+
+// Leave room for simulated alternatives (scored id + 1..k) within the vocabulary.
+const TINY_CONFIG_JSON: &str = r#"{
+  "model_type": "pegainfer_sim",
+  "max_position_embeddings": 128,
+  "vocab_size": 16
+}"#;

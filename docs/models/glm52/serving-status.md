@@ -1,31 +1,92 @@
-# GLM5.2 Serving Status & Remaining Work
+# GLM5.2 serving status
 
-> **TL;DR:** Decode serving is feature-complete for its scope (whole-step graph buckets, DSpark speculation, paged KV + prefix cache, VRAM-derived max_model_len, pegaflow host-tier offload behind `--kv-offload`); sampling surface frozen at `temperature/top_p/top_k/min_p/seed`. Low-latency arc: `--moe-topo tp8` (#609) + span MTP (#610) + attention-TP with replicated activations (`feat/glm52-attn-tp`, solo 13.75 ms / MTP code 221 tok/s — see `moe-tp8-low-latency.md`). Cross-tray EP-N on GB300 NVL72 shipped on `feat/glm52-rank-host`: `--rank-hosts` remote ranks over framed TCP, EP widths {4..64} instantiated, 2-tray EP8 solo p50 23.61 / p99 24.00 ms (see `cross-node-scaling.md`). Target-only cross-engine P/D is implemented and fully gated in #657; Pegaflow #395 is pinned and landing remains ordered only behind stacked OpenInfer #540, while DSpark state transfer remains separate scope.
+> **TL;DR:** GLM5.2 is **Blackwell-only** (compute capability ≥ 10). Decode serving is EP4 / EP8 / one-domain EP-N with SM100 DeepGEMM masked grouped expert GEMMs; TP4 is **prefill-only** (NCCL). Hopper (SM9x), decode TP8/TP4 LL, and the old SM90 DeepGEMM path are removed. Continuous batching, whole-step CUDA Graphs, sampling, DSpark, paged KV, prefix caching, host offload, and target-only vLLM→PegaInfer P/D remain on the EP decode path. The line stays Bring-up until long-context indexer correctness and lifecycle reliability are closed.
 >
 > **Last touched:** 2026-07
 
-## Sampling surface (ruled 2026-07-06: frozen, sufficient)
+## Current shape
 
-Supported per-request, honor-or-reject, on both the plain path (#586) and the speculative path (#589): `temperature`, `top_p`, `top_k`, `min_p`, `seed`.
+GLM5.2 is a model-owned distributed serving engine. Launch fails closed on Hopper and older GPUs. The project tier remains **Bring-up** until the correctness and reliability contracts below are continuously enforceable.
 
-Deliberately **not** supported — audited, ruled out:
+### Topologies
 
-- `stop` strings / `stop_token_ids` / `min_tokens` / `logprobs` — rejected or ignored at scheduler admission.
-- Penalty trio (`presence`/`frequency`/`repetition`) and `n > 1`.
+| `--moe-topo` | Intended use | Evidence boundary |
+| --- | --- | --- |
+| `ep8` | Default high-throughput decode (8 GPUs / multi-tray EP8) | Strongest feature coverage on the free-running EP path: bucketed continuous batching, DSpark, prefix cache, offload, P/D. The SM100 DeepGEMM chain has cross-process EP8 execution coverage. |
+| `ep4` | Throughput decode on 4×GB300 | SM100 DeepGEMM numerical oracle, automatic VRAM-budget, and four-bucket graph-capture gates pass. Same-session replacement A/B improved decode p50 by 3.64% and aggregate throughput by 3.9%. |
+| `ep16` / `ep32` / `ep64` | Scale within one NVLink/IMEX domain | Per-width DeepEP shims + SM100 DeepGEMM template instantiations; multi-process via `--glm52-ranks` + `--glm52-rendezvous`. The current replacement was execution-tested at EP4 and EP8, not these wider widths. |
+| `tp4` | **Prefill-only** on 4×GB300 | Requires `--glm52-prefill-only` (and `--tp-size=4`). Layer-outer NCCL bf16 all-reduce path; no decode CUDA graph / no LL packet MoE. See `tp4-prefill-only.md`. |
 
-Known limitation: HTTP `seed` is stripped to `None` by the shared vLLM frontend (`wire.rs`), a qwen3-era gap (#284). Engine-level seed works — the #589 determinism gates drive it through `EngineHandle` directly.
+**Removed (no longer parse / fail at launch):**
 
-## Remaining model-line work
+- Hopper SM9x targets (including 8×H200 as a supported floor)
+- `--moe-topo=tp8` and decode-time TP LL (phase MoE + attention AR)
+- TP4 as a decode topology (decode used FlashMLA/LL; only prefill-only remains)
 
-1. **Land target-only cross-engine P/D** (vLLM prefill → OpenInfer decode) — #657 implements hash/layout compatibility, tail restore, strict zero-prefill, and the measured acceptance gates in `pd-m2-execution.md`. Pegaflow #395 is merged and pinned; #657 only waits for its stacked base #540. Preserving a model-based speculator with its own KV remains additional scope: vLLM transfers target + draft KV, while OpenInfer's 99 arenas/rank cover target state only.
-2. **#590 DSpark × prefix caching/P-D** — currently mutually exclusive. Compatibility path: restore the full target prompt including the partial tail, admit the target at `suffix == 1`, and cold-start the drafter from the boundary token's aux-hidden capture; never expose absent draft pages as valid. Measure first-round and steady-state acceptance before paying for vLLM-style draft-KV transfer (80 KiB/token, making target+draft state about 2.52× target-only). See `vllm-speculative-pd-audit.md`.
-3. **Perf backlog** — accept parity with the vLLM production reference is reached, so the first TPOT lever is round cost: #582 draft-round graph (external PR #591: −4.9% draft round re-measured on the reference host, Request-Changes for three capture bugs, waiting on the author), #559 bucket-4/8 step premium, adaptive span (5% of rounds accept all 7 drafts), #542 collective wait structure, #569 PDL weight prefetch, cache-aware placement (admission picks a rank before the prefix match — worst-case hit rate ÷8 under concurrency).
+Historical measurement records for removed paths stay under `docs/models/glm52/` (e.g. `moe-tp8-low-latency.md`, older Hopper EP8 notes) but are not launch contracts.
 
-Done since the 2026-07-06 ruling: pegaflow M1 host-tier offload (#600), `scheduler.rs` split (#594), and coordinator phase decomposition (#596); #548 closed — the Python `vllm bench serve` c8 hang no longer reproduces on main (64/64, 216.9 tok/s, TPOT p50 30.8 / p99 34.2 ms).
+See `tp4-prefill-only.md`, `ep4-gb300.md`, `free-running-dp.md`, and `cross-node-scaling.md` for active topology records.
 
-## Shelved / background
+## Serving capabilities
 
-- **#551 one-off silent request drop** — never reproduced (>3500-request soaks plus a 40-round instrumented soak on 8×H200); kept open as a background watch, off the active queue.
-- **#587 observability** (batch occupancy + `EngineHandle` `with_kv_capacity`/`load_watch`/`kv_events` wiring) — deferred pending discussion.
-- **#541 indexer oracle reference drift** — HF `glm_moe_dsa` is a moving target; the gate stays excluded on main.
-- **#584 empty completion echoes the prompt** — shared-frontend bug, pre-existing.
+| Area | Current contract |
+| --- | --- |
+| Hardware | Blackwell (SM ≥ 10.0); multi-process EP probes only **local** GPU ordinals |
+| Scheduling | Up to 8 slots per logical EP rank; `{1,2,4,8}` whole-step graph buckets; least-loaded admission |
+| Attention | DSA indexer plus sparse MLA decode (FlashMLA SM100 / FlashInfer on TP4 prefill heads=16) |
+| Sampling | `temperature`, `top_p`, `top_k`, `min_p`, and engine-level `seed`, honor-or-reject |
+| Speculation | DSpark greedy and sampled verify on EP decode; span 4 default; verify spans reuse decode buckets |
+| KV | 64-token paged pool, full-lifetime admission, prefix cache on by default |
+| Offload | PegaFlow host-tier save/restore behind `--kv-offload` (EP; not TP4 prefill-only without native MTP) |
+| P/D | Native-MTP handoff: PegaInfer TP4 prefill-only → EP decode (`first_step=verify`); the vLLM-prefill compat path is removed |
+| Observability | Per-logical-partition running/waiting/KV gauges and decode graph export (EP) |
+| Cross-node EP | One process per node hosting its own ranks (`--glm52-ranks` + `--glm52-rendezvous`); free-running per-rank engines; DeepEP is the only runtime coupling |
+
+The supported P/D path is the native-MTP handoff (`pd-native-mtp-handoff.md`). The retired vLLM-prefill target-only path (#657) was removed along with its doc; DSpark draft state was never part of any transfer protocol.
+
+## Sampling and API limits
+
+The model engine supports `temperature`, `top_p`, `top_k`, `min_p`, and `seed` on both plain and speculative paths. Engine-level seeded replay is deterministic for the same occupancy timeline.
+
+The following surfaces are not part of the GLM5.2 contract:
+
+- `logprobs`, prompt logprobs, and `n > 1`;
+- presence, frequency, and repetition penalties;
+- GLM-specific guarantees for stop strings, stop token IDs, or `min_tokens` beyond the shared frontend behavior.
+
+HTTP `seed` is still lost in the shared frontend before reaching the engine. Bucket changes can also alter floating-point association, so a greedy request may diverge at a near-tied token when its occupancy timeline changes. Runs with the same request and bucket timeline remain deterministic.
+
+## Promotion blockers
+
+### 1. Reproducible long-context correctness
+
+Issue #541 is the main tier blocker. The indexer oracle once passed against a moving Transformers development reference, but that reference changed and the result is not reproducible. The current engine has passed end-to-end 4k/8k/16k NIAH, yet that probe cannot replace a pinned sparse-index selection gate.
+
+The padded-vocabulary contract is also under repair in #680/#698. The checkpoint contains token IDs the frontend tokenizer cannot decode; every EP, sampling, and DSpark token-producing path must be structurally bounded to the decodable prefix.
+
+### 2. Request lifecycle reliability
+
+Issue #551 records one request that entered the frontend but never reached a terminal engine event. More than 3,500 later requests and extended soaks did not reproduce it. It remains a background reliability boundary until a trace identifies the cause or a sufficiently strong retained soak demotes it.
+
+### 3. Feature composition
+
+DSpark is mutually exclusive with prefix caching, host offload, and P/D. A prefix hit skips the target forwards that normally produce DSpark's historical auxiliary state. Issue #590 must first measure a position-correct boundary cold start before the project considers transferring the additional draft K/V payload.
+
+In the multi-process cross-node shape, KV offload registers each node's local arenas on its own pegaflow host under the shared deterministic namespace.
+
+## Performance work
+
+Measured open work is topology-specific:
+
+- The SM100 DeepGEMM replacement measured a same-session EP4 decode p50 improvement of 3.64% and aggregate throughput improvement of 3.9%. Re-profile this chain before carrying forward any expert-kernel optimization from the retired weight-only path.
+- The cross-process EP8 execution smoke measured approximately 22.3 ms p50 and 358–359 tok/s aggregate; it was not an EP8 A/B.
+- #582: graph the DSpark draft round only after its fixed launch cost matters; it is currently a small fraction of the verify round.
+- Older Hopper EP8/TP8 investigations (#542/#559/#569/#608/#625) are historical evidence only — do not implement without a matched A/B on the **current Blackwell** topology.
+
+No optimization should be carried forward from historical records without a matched A/B on the current topology.
+
+## Background work
+
+- #587: expose active slots, current bucket, and queue depth in addition to the scheduler gauges already shipped.
+- PegaFlow metaserver recovery: republish the existing block catalog after reconnect; new saves recover today, old remote prefixes do not.
+- General scale-out beyond a single NVLink/IMEX domain: preserve the per-node-process contract (free-running ranks + bootstrap rendezvous), but use a data plane designed and measured for IB/RoCE rather than treating the one-rack result as universal.

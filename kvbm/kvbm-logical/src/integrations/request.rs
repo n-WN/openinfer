@@ -101,12 +101,16 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::KvbmSequenceHashProvider;
-use crate::blocks::{BlockMetadata, ImmutableBlock};
-use crate::manager::BlockManager;
-use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
+use dynamo_tokens::SaltHash;
+use dynamo_tokens::Token;
 
-use dynamo_tokens::{SaltHash, Token};
+use crate::KvbmSequenceHashProvider;
+use crate::blocks::BlockMetadata;
+use crate::blocks::ImmutableBlock;
+use crate::manager::BlockManager;
+use crate::sequence::BlockSequence;
+use crate::sequence::LogicalBlockAssignmentError;
+use crate::sequence::LogicalBlockAssignments;
 
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
@@ -349,6 +353,39 @@ impl<T: BlockMetadata> RequestSequence<T> {
         completed_block
     }
 
+    /// Complete the trailing partial token block with `pad`, naming only:
+    /// neither `num_input_tokens` nor `generated_tokens` moves, no block is
+    /// staged or allocated. Returns the number of pads appended.
+    pub(crate) fn pad_tail_block(&mut self, pad: Token) -> usize {
+        let block_size = self.sequence.block_size();
+        let mut appended = 0;
+        while !self.sequence.total_tokens().is_multiple_of(block_size) {
+            self.sequence
+                .append_token(pad)
+                .expect("pad append cannot fail below a block boundary");
+            appended += 1;
+        }
+        appended
+    }
+
+    /// Reclassify the final input token as the first generated token.
+    ///
+    /// The token sequence itself is unchanged. This is used when an external
+    /// prefill worker supplied KV for every preceding input token and emitted
+    /// the final token without computing its KV on this worker.
+    pub(crate) fn promote_last_input_to_generated(&mut self) {
+        assert!(
+            self.num_input_tokens > 0,
+            "Cannot promote an input token from an empty prompt"
+        );
+        assert!(
+            self.generated_tokens < self.max_output_tokens,
+            "Cannot promote input token: reached max_output_tokens limit"
+        );
+        self.num_input_tokens -= 1;
+        self.generated_tokens += 1;
+    }
+
     /// Whether `generated_tokens >= max_output_tokens`.
     pub fn is_complete(&self) -> bool {
         self.generated_tokens >= self.max_output_tokens
@@ -497,30 +534,6 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.sequence.block_size()
     }
 
-    /// All block IDs in order: assigned ++ staged ++ unassigned.
-    ///
-    /// Block IDs identity-map to page indices in the GPU page pool.
-    pub fn page_indices(&self) -> Vec<u32> {
-        self.assignments
-            .all_block_ids()
-            .map(|&id| id as u32)
-            .collect()
-    }
-
-    /// Drop excess unassigned blocks beyond `keep` count.
-    /// Returns the number of blocks dropped (RAII returns them to reset pool).
-    pub fn drop_excess_unassigned(&mut self, keep: usize) -> usize {
-        let mut dropped = 0;
-        while self.assignments.unassigned_count() > keep {
-            if self.assignments.pop_last_unassigned().is_some() {
-                dropped += 1;
-            } else {
-                break;
-            }
-        }
-        dropped
-    }
-
     // =====================================================================
     // Crate-internal mutation accessors
     // =====================================================================
@@ -562,7 +575,8 @@ impl<T: BlockMetadata> std::fmt::Debug for RequestSequence<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{TestMeta, create_test_manager};
+    use crate::testing::TestMeta;
+    use crate::testing::create_test_manager;
 
     const BLOCK_SIZE: u32 = 4;
 

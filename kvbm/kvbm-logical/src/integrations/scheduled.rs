@@ -149,12 +149,12 @@
 use std::sync::Arc;
 
 use derive_builder::Builder;
-
-use crate::blocks::BlockMetadata;
-use crate::manager::BlockManager;
+use dynamo_tokens::SaltHash;
+use dynamo_tokens::Token;
 
 use super::request::RequestSequence;
-use dynamo_tokens::{SaltHash, Token};
+use crate::blocks::BlockMetadata;
+use crate::manager::BlockManager;
 
 // =============================================================================
 // State types
@@ -346,6 +346,18 @@ pub enum ApplyError {
     MissingTokenOnFinalChunk,
     #[error("append requested {requested} tokens but only {remaining} remain")]
     AppendExceedsRemaining { requested: usize, remaining: usize },
+    #[error(
+        "external prefill anchor requires one uncomputed final input token \
+         (prefill={prefill_position}, kv={kv_position}, input={num_input_tokens}, \
+         tail={tail_tokens}, remaining_output={remaining_output})"
+    )]
+    InvalidExternalPrefillAnchor {
+        prefill_position: usize,
+        kv_position: usize,
+        num_input_tokens: usize,
+        tail_tokens: usize,
+        remaining_output: usize,
+    },
 }
 
 // =============================================================================
@@ -865,6 +877,52 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         Ok(())
     }
 
+    /// Complete the trailing partial block with `pad` and register it, so a
+    /// handoff seal can save it under the padded hash. Naming only: no token
+    /// count moves, `kv_position` is untouched, no block is allocated. No-op
+    /// when `kv_position` sits on a block boundary — the partial block would
+    /// hold no computed rows, and a name for pure garbage serves no one.
+    /// Requires Idle state; the sequence must not schedule prefill again.
+    pub fn pad_tail_block(
+        &mut self,
+        pad: Token,
+        manager: &BlockManager<T>,
+    ) -> Result<usize, ApplyError> {
+        self.require_idle_for_apply()?;
+        if self.kv_position.is_multiple_of(self.inner.block_size()) {
+            return Ok(0);
+        }
+        let appended = self.inner.pad_tail_block(pad);
+        self.inner.complete_and_register_pending(manager);
+        Ok(appended)
+    }
+
+    /// Finish an externally restored prefill by promoting its final input
+    /// token to the single dangling generated token.
+    ///
+    /// The external worker has computed KV through `kv_position` and emitted
+    /// the next token, but that token's KV deliberately does not exist yet.
+    /// Reclassifying it makes the sequence equivalent to a local
+    /// `apply_prefill(Some(token))` without falsely advancing `kv_position`.
+    pub fn adopt_external_prefill_anchor(&mut self) -> Result<(), ApplyError> {
+        self.require_idle_for_apply()?;
+        let valid = self.prefill_position == self.kv_position
+            && self.prefill_position.checked_add(1) == Some(self.inner.num_input_tokens())
+            && self.tail_tokens() == 1
+            && self.inner.remaining_tokens() > 0;
+        if !valid {
+            return Err(ApplyError::InvalidExternalPrefillAnchor {
+                prefill_position: self.prefill_position,
+                kv_position: self.kv_position,
+                num_input_tokens: self.inner.num_input_tokens(),
+                tail_tokens: self.tail_tokens(),
+                remaining_output: self.inner.remaining_tokens(),
+            });
+        }
+        self.inner.promote_last_input_to_generated();
+        Ok(())
+    }
+
     // =====================================================================
     // Accessors
     // =====================================================================
@@ -893,11 +951,6 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
     /// After prefill: 1 (the first generated token). After decode: 1 (the new token).
     pub fn tail_tokens(&self) -> usize {
         self.inner.total_tokens().saturating_sub(self.kv_position)
-    }
-
-    /// Reference to the delegate.
-    pub fn delegate(&self) -> &Arc<dyn SequenceDelegate> {
-        &self.delegate
     }
 
     // Forwarded from RequestSequence
@@ -1031,9 +1084,11 @@ impl<T: BlockMetadata> std::fmt::Debug for SchedulableSequence<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testing::{TestMeta, create_test_manager};
     use std::sync::Mutex;
+
+    use super::*;
+    use crate::testing::TestMeta;
+    use crate::testing::create_test_manager;
 
     const BLOCK_SIZE: u32 = 4;
 
@@ -1110,6 +1165,50 @@ mod tests {
     // =========================================================================
     // State machine enforcement
     // =========================================================================
+
+    #[test]
+    fn test_pad_tail_block_names_the_partial_block() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(6),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(6, &manager).unwrap();
+        seq.apply_prefill(Some(100), &manager).unwrap();
+        assert_eq!(seq.kv_position(), 6);
+        assert_eq!(seq.assigned_blocks(), 1);
+
+        let appended = seq.pad_tail_block(999, &manager).unwrap();
+        assert_eq!(appended, 1, "tokens 4,5 + anchor + one pad fill the block");
+        assert_eq!(seq.kv_position(), 6, "naming only");
+        assert_eq!(seq.generated_tokens(), 1, "pads are not generated tokens");
+        assert_eq!(seq.assigned_blocks(), 2, "the padded block registered");
+        assert_eq!(seq.state(), SequenceState::Idle);
+        assert_eq!(seq.inner().sequence().all_sequence_hashes().len(), 2);
+    }
+
+    #[test]
+    fn test_pad_tail_block_noop_on_boundary() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(4),
+            10,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(4, &manager).unwrap();
+        seq.apply_prefill(Some(100), &manager).unwrap();
+        assert_eq!(seq.kv_position(), 4);
+
+        let appended = seq.pad_tail_block(999, &manager).unwrap();
+        assert_eq!(appended, 0, "no computed rows in the partial block");
+        assert_eq!(seq.assigned_blocks(), 1, "nothing new registered");
+        assert_eq!(seq.tail_tokens(), 1, "the dangling anchor stays unnamed");
+    }
 
     #[test]
     fn test_schedule_prefill_requires_idle() {
@@ -1374,6 +1473,35 @@ mod tests {
         seq.schedule_prefill(4, &manager).unwrap();
         let err = seq.apply_prefill(None, &manager).unwrap_err();
         assert!(matches!(err, ApplyError::MissingTokenOnFinalChunk));
+    }
+
+    #[test]
+    fn test_external_prefill_anchor_enters_speculative_decode() {
+        let manager = create_test_manager::<TestMeta>(20);
+        // KV for the first four tokens was restored from another worker. The
+        // fifth token is that worker's generated anchor and has no KV yet.
+        let mut seq = SchedulableSequence::<TestMeta>::new(
+            make_tokens(5),
+            4,
+            BLOCK_SIZE,
+            noop_delegate(),
+            None,
+        );
+        seq.schedule_prefill(4, &manager).unwrap();
+        seq.apply_prefill(None, &manager).unwrap();
+
+        seq.adopt_external_prefill_anchor().unwrap();
+        assert!(seq.is_prefill_complete());
+        assert_eq!(seq.num_input_tokens(), 4);
+        assert_eq!(seq.generated_tokens(), 1);
+        assert_eq!(seq.kv_position(), 4);
+        assert_eq!(seq.tail_tokens(), 1);
+
+        seq.schedule_speculative(2, &manager).unwrap();
+        seq.apply_speculative(&[100, 101], &manager).unwrap();
+        assert_eq!(seq.generated_tokens(), 3);
+        assert_eq!(seq.kv_position(), 6);
+        assert_eq!(seq.tail_tokens(), 1);
     }
 
     // =========================================================================

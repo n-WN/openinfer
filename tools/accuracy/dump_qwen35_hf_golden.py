@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the HuggingFace bf16 logprob golden for the Qwen3.5 gate.
 
-The Rust gate replays these fixed token sequences through openinfer with
+The Rust gate replays these fixed token sequences through pegainfer with
 teacher-forced decode and compares top-K logprobs against this stored HF oracle.
 For Qwen3.5 the HF oracle follows the same incremental shape: prefill the prompt
 with `use_cache=True`, then feed one fixed decode token at a time through
@@ -37,8 +37,10 @@ TOP_K = 64
 
 
 # Keep in sync with `fixture_size_name` in
-# openinfer-qwen35-4b/tests/hf_golden_gate.rs (the size-key geometry table).
+# pegainfer-qwen35/tests/hf_golden_gate.rs (the size-key geometry table).
 SIZE_NAMES = {
+    (1024, 24): "Qwen3.5-0.8B",
+    (2048, 24): "Qwen3.5-2B",
     (2560, 32): "Qwen3.5-4B",
     (4096, 32): "Qwen3.5-9B",
     (5120, 64): "Qwen3.5-27B",

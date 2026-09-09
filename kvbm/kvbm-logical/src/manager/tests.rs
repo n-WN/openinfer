@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use rstest::rstest;
+
 use super::*;
 use crate::KvbmSequenceHashProvider;
 use crate::blocks::BlockError;
-use crate::testing::{
-    self, TestMeta, create_iota_token_block, create_test_token_block as testing_create_token_block,
-};
-use rstest::rstest;
+use crate::testing::TestMeta;
+use crate::testing::create_iota_token_block;
+use crate::testing::create_test_token_block as testing_create_token_block;
+use crate::testing::{self};
 
 // Type alias for backward compatibility
 type TestBlockData = TestMeta;
@@ -2344,11 +2346,12 @@ mod scan_matches_tests {
 // ============================================================================
 
 mod race_regression_tests {
-    use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
+    use super::*;
     use crate::pools::BlockDuplicationPolicy;
 
     fn build_manager_with_policy(
@@ -2629,11 +2632,11 @@ mod lock_order_enforcement_tests {
 // ============================================================================
 
 mod audit_counter_tests {
-    use super::*;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::thread;
 
+    use super::*;
     use crate::SequenceHash;
     use crate::blocks::BlockId;
     use crate::manager::FrequencyTrackingCapacity;
@@ -3890,6 +3893,47 @@ mod reset_on_release_tests {
             "primary drop honors its own flag (default false → inactive), \
              unaffected by duplicate's flag"
         );
+    }
+
+    /// A duplicate must mark its hidden primary, not only its own slot.
+    #[test]
+    fn duplicate_can_mark_canonical_primary_for_reset() {
+        let manager = create_test_manager(4);
+        let token = create_test_token_block_from_iota(50_041);
+        let hash = token.kvbm_sequence_hash();
+
+        let primary_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate primary")
+            .into_iter()
+            .next()
+            .unwrap();
+        let primary = manager.register_block(primary_mutable.complete(&token).unwrap());
+
+        let duplicate_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate duplicate")
+            .into_iter()
+            .next()
+            .unwrap();
+        let duplicate = manager.register_block(duplicate_mutable.complete(&token).unwrap());
+        assert_ne!(primary.block_id(), duplicate.block_id());
+
+        duplicate.set_primary_reset_on_release(true);
+
+        let store = manager.store_for_test();
+        drop(primary);
+        assert_eq!(
+            store.reset_len(),
+            2,
+            "the duplicate must keep the primary active until its own drop"
+        );
+
+        drop(duplicate);
+
+        assert_eq!(store.inactive_len(), 0);
+        assert_eq!(store.reset_len(), 4);
+        assert!(!manager.block_registry().is_registered(hash));
     }
 
     /// Pool gauges (`inflight_immutable`, `inactive_pool_size`,
