@@ -771,6 +771,7 @@ mod tests {
         let update = prompt_update(
             queued.id,
             Some(TokenLogprob {
+                rank: 1,
                 logprob: -0.5,
                 top_logprobs: Vec::new(),
             }),

@@ -1,6 +1,7 @@
 //! Qwen3.5 scheduler backend abstraction (single-GPU + TP).
 
 use super::*;
+use crate::logprobs::LogprobSnapshot;
 
 pub(super) struct SingleGpuBackend {
     model: Qwen35Model,
@@ -100,7 +101,7 @@ fn single_decode_views(active: &mut [ActiveRequest35]) -> (Vec<u32>, Vec<&mut Kv
 
 /// Pair each sampled token with its host logprob row, where one was requested.
 fn attached_logprobs(
-    cpu_logits: Vec<Option<(Vec<f32>, usize)>>,
+    cpu_logits: Vec<Option<LogprobSnapshot>>,
     tokens: &[u32],
 ) -> Vec<Option<TokenLogprob>> {
     cpu_logits

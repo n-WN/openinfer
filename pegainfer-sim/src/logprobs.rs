@@ -1,7 +1,8 @@
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::TokenLogprob;
 
-const PROMPT_LOGPROB: f32 = -0.5;
+const PROMPT_LOGPROB: f32 = -2.5;
+const PROMPT_RANK: u32 = 3;
 const COMPLETION_LOGPROB: f32 = -0.25;
 const FIRST_ALTERNATIVE_LOGPROB: f32 = -1.0;
 
@@ -12,6 +13,7 @@ pub(super) fn prompt(ids: &[u32], top_k: usize) -> PromptEcho {
         .map(|(index, &id)| {
             (index > 0).then(|| TokenLogprob {
                 logprob: PROMPT_LOGPROB,
+                rank: PROMPT_RANK,
                 top_logprobs: alternatives(id, top_k),
             })
         })
@@ -25,6 +27,7 @@ pub(super) fn prompt(ids: &[u32], top_k: usize) -> PromptEcho {
 pub(super) fn completion(id: u32, top_k: usize) -> TokenLogprob {
     TokenLogprob {
         logprob: COMPLETION_LOGPROB,
+        rank: 1,
         top_logprobs: alternatives(id, top_k),
     }
 }

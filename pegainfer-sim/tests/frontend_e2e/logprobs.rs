@@ -45,6 +45,10 @@ async fn explicit_prompt_logprobs_returns_scored_prompt_positions() -> Result<()
             map.contains_key(&scored),
             "position {index} must contain its scored token {scored}: {completion}"
         );
+        assert_eq!(
+            map[&scored]["rank"], 3,
+            "prompt token is behind two candidates"
+        );
     }
     // Completion logprobs were not requested.
     assert!(
@@ -95,6 +99,7 @@ async fn explicit_zero_prompt_logprobs_returns_scored_token_only() -> Result<()>
     );
     assert!(prompt_logprobs[0].is_null());
     let scored = body["prompt"][1].to_string();
+    assert_eq!(prompt_logprobs[1][&scored]["rank"], 3);
     assert!(
         prompt_logprobs[1]
             .as_object()

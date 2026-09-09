@@ -2,11 +2,13 @@ use anyhow::Result;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 
+pub(crate) type LogprobSnapshot = (Vec<f32>, usize);
+
 pub(crate) fn snapshot_requested_logprobs(
     ctx: &DeviceContext,
     logits: &HiddenStates,
     requested_top_k: &[Option<usize>],
-) -> Result<Vec<Option<(Vec<f32>, usize)>>> {
+) -> Result<Vec<Option<LogprobSnapshot>>> {
     anyhow::ensure!(
         requested_top_k.len() <= logits.seq_len,
         "Qwen3.5 logprobs request/logits row mismatch: requested={}, logits_rows={}",

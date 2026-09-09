@@ -22,14 +22,10 @@ pub(crate) fn to_wire_position_logprobs(
 ) -> Option<PositionLogprobs> {
     let lp = logprob?;
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
-    // pegainfer-core does not currently expose the sampled token's vocab rank.
-    // rank: 1 is correct for greedy sampling, where the sampled token is top-1,
-    // and is a lossy placeholder for non-greedy sampling.
-    // See discussion on PR #96.
     entries.push(WireTokenLogprob {
         token_id,
         logprob: lp.logprob,
-        rank: 1,
+        rank: lp.rank,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
         if alt_id == token_id {
@@ -340,6 +336,7 @@ mod tests {
     #[test]
     fn to_wire_logprobs_emits_sampled_then_alternatives() {
         let lp = TokenLogprob {
+            rank: 1,
             logprob: -0.5,
             top_logprobs: vec![(7, -0.5), (42, -1.5)],
         };
@@ -362,6 +359,7 @@ mod tests {
     #[test]
     fn to_wire_logprobs_keeps_distinct_top_k_alternatives() {
         let lp = TokenLogprob {
+            rank: 1,
             logprob: -0.5,
             top_logprobs: vec![(8, -1.0), (9, -1.5)],
         };
@@ -386,6 +384,7 @@ mod tests {
 
     fn score() -> TokenLogprob {
         TokenLogprob {
+            rank: 1,
             logprob: -0.5,
             top_logprobs: Vec::new(),
         }
